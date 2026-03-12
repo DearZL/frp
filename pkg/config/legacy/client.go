@@ -356,6 +356,8 @@ func GetDefaultClientConf() ClientCommonConf {
 		DisableCustomTLSFirstByte: true,
 		Metas:                     make(map[string]string),
 		IncludeConfigFiles:        make([]string, 0),
+		HeartbeatInterval:         30,
+		HeartbeatTimeout:          90,
 	}
 }
 
