@@ -8,23 +8,13 @@
         </div>
 
         <div class="actions-section">
-          <el-button :icon="Refresh" class="action-btn" @click="fetchData"
-            >Refresh</el-button
-          >
+          <ActionButton variant="outline" size="small" @click="refreshData">
+            Refresh
+          </ActionButton>
 
-          <el-popconfirm
-            title="Clear all offline proxies?"
-            width="220"
-            confirm-button-text="Clear"
-            cancel-button-text="Cancel"
-            @confirm="clearOfflineProxies"
-          >
-            <template #reference>
-              <el-button :icon="Delete" class="action-btn" type="danger" plain
-                >Clear Offline</el-button
-              >
-            </template>
-          </el-popconfirm>
+          <ActionButton variant="outline" size="small" danger @click="showClearDialog = true">
+            Clear Offline
+          </ActionButton>
         </div>
       </div>
 
@@ -37,29 +27,6 @@
             clearable
             class="main-search"
           />
-
-          <el-select
-            :model-value="selectedClientKey"
-            placeholder="All Clients"
-            clearable
-            filterable
-            class="client-select"
-            @change="onClientFilterChange"
-          >
-            <el-option label="All Clients" value="" />
-            <el-option
-              v-if="clientIDFilter && !selectedClientInList"
-              :label="`${userFilter ? userFilter + '.' : ''}${clientIDFilter} (not found)`"
-              :value="selectedClientKey"
-              style="color: var(--el-color-warning); font-style: italic"
-            />
-            <el-option
-              v-for="client in clientOptions"
-              :key="client.key"
-              :label="client.label"
-              :value="client.key"
-            />
-          </el-select>
         </div>
 
         <div class="type-tabs">
@@ -77,25 +44,49 @@
     </div>
 
     <div v-loading="loading" class="proxies-content">
-      <div v-if="filteredProxies.length > 0" class="proxies-list">
+      <div v-if="proxies.length > 0" class="proxies-list">
         <ProxyCard
-          v-for="proxy in filteredProxies"
-          :key="proxy.name"
+          v-for="proxy in proxies"
+          :key="`${proxy.type}:${proxy.name}`"
           :proxy="proxy"
+          :show-type="activeType === 'all'"
         />
       </div>
       <div v-else-if="!loading" class="empty-state">
         <el-empty description="No proxies found" />
       </div>
     </div>
+
+    <div v-if="total > 0" class="pagination-section">
+      <ElPagination
+        :current-page="page"
+        :page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        :total="total"
+        layout="total, sizes, prev, pager, next"
+        @current-change="onPageChange"
+        @size-change="onPageSizeChange"
+      />
+    </div>
+
+    <ConfirmDialog
+      v-model="showClearDialog"
+      title="Clear Offline"
+      message="Are you sure you want to clear all offline proxies?"
+      confirm-text="Clear"
+      danger
+      @confirm="handleClearConfirm"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, watch, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
-import { Search, Refresh, Delete } from '@element-plus/icons-vue'
+import { ElMessage, ElPagination } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
+import ActionButton from '@shared/components/ActionButton.vue'
+import ConfirmDialog from '@shared/components/ConfirmDialog.vue'
 import {
   BaseProxy,
   TCPProxy,
@@ -108,171 +99,188 @@ import {
 } from '../utils/proxy'
 import ProxyCard from '../components/ProxyCard.vue'
 import {
-  getProxiesByType,
+  getProxiesV2,
   clearOfflineProxies as apiClearOfflineProxies,
 } from '../api/proxy'
 import { getServerInfo } from '../api/server'
-import { getClients } from '../api/client'
-import { Client } from '../utils/client'
+import type { ProxyStatsInfo } from '../types/proxy'
+import type { ServerInfo } from '../types/server'
 
 const route = useRoute()
 const router = useRouter()
 
 const proxyTypes = [
+  { label: 'All', value: 'all' },
   { label: 'TCP', value: 'tcp' },
   { label: 'UDP', value: 'udp' },
   { label: 'HTTP', value: 'http' },
   { label: 'HTTPS', value: 'https' },
   { label: 'TCPMUX', value: 'tcpmux' },
   { label: 'STCP', value: 'stcp' },
+  { label: 'XTCP', value: 'xtcp' },
   { label: 'SUDP', value: 'sudp' },
 ]
 
-const activeType = ref((route.params.type as string) || 'tcp')
+const activeType = ref((route.params.type as string) || 'all')
 const proxies = ref<BaseProxy[]>([])
-const clients = ref<Client[]>([])
 const loading = ref(false)
 const searchText = ref('')
-const clientIDFilter = ref((route.query.clientID as string) || '')
-const userFilter = ref((route.query.user as string) || '')
+const showClearDialog = ref(false)
+const page = ref(1)
+const pageSize = ref(10)
+const total = ref(0)
+let requestSeq = 0
+let searchDebounceTimer: number | null = null
 
-const clientOptions = computed(() => {
-  return clients.value
-    .map((c) => ({
-      key: c.key,
-      clientID: c.clientID,
-      user: c.user,
-      label: c.user ? `${c.user}.${c.clientID}` : c.clientID,
-    }))
-    .sort((a, b) => a.label.localeCompare(b.label))
-})
+// Server info cache - cache the Promise itself so concurrent first calls
+// from Promise.all (convertProxies) don't kick off multiple HTTP requests.
+let serverInfoPromise: Promise<ServerInfo> | null = null
 
-// Compute selected client key for el-select v-model
-const selectedClientKey = computed(() => {
-  if (!clientIDFilter.value) return ''
-  const client = clientOptions.value.find(
-    (c) => c.clientID === clientIDFilter.value && c.user === userFilter.value,
-  )
-  // Return a synthetic key even if not found, so the select shows the filter is active
-  return client?.key || `${userFilter.value}:${clientIDFilter.value}`
-})
-
-// Check if the filtered client exists in the client list
-const selectedClientInList = computed(() => {
-  if (!clientIDFilter.value) return true
-  return clientOptions.value.some(
-    (c) => c.clientID === clientIDFilter.value && c.user === userFilter.value,
-  )
-})
-
-const filteredProxies = computed(() => {
-  let result = proxies.value
-
-  // Filter by clientID and user if specified
-  if (clientIDFilter.value) {
-    result = result.filter(
-      (p) => p.clientID === clientIDFilter.value && p.user === userFilter.value,
-    )
+const fetchServerInfo = (): Promise<ServerInfo> => {
+  if (!serverInfoPromise) {
+    serverInfoPromise = getServerInfo().catch((err) => {
+      // Allow retry after failure
+      serverInfoPromise = null
+      throw err
+    })
   }
+  return serverInfoPromise
+}
 
-  // Filter by search text
-  if (searchText.value) {
-    const search = searchText.value.toLowerCase()
-    result = result.filter((p) => p.name.toLowerCase().includes(search))
+const convertProxy = async (
+  proxy: ProxyStatsInfo,
+): Promise<BaseProxy | null> => {
+  const type = proxy.type || activeType.value
+  if (type === 'tcp') {
+    return new TCPProxy(proxy)
   }
-
-  return result
-})
-
-const onClientFilterChange = (key: string) => {
-  if (key) {
-    const client = clientOptions.value.find((c) => c.key === key)
-    if (client) {
-      router.replace({
-        query: { ...route.query, clientID: client.clientID, user: client.user },
-      })
+  if (type === 'udp') {
+    return new UDPProxy(proxy)
+  }
+  if (type === 'http') {
+    const info = await fetchServerInfo()
+    if (info && info.config.vhostHTTPPort) {
+      return new HTTPProxy(
+        proxy,
+        info.config.vhostHTTPPort,
+        info.config.subdomainHost,
+      )
     }
-  } else {
-    const query = { ...route.query }
-    delete query.clientID
-    delete query.user
-    router.replace({ query })
+    return null
   }
-}
-
-const fetchClients = async () => {
-  try {
-    const json = await getClients()
-    clients.value = json.map((data) => new Client(data))
-  } catch {
-    // Ignore errors when fetching clients
+  if (type === 'https') {
+    const info = await fetchServerInfo()
+    if (info && info.config.vhostHTTPSPort) {
+      return new HTTPSProxy(
+        proxy,
+        info.config.vhostHTTPSPort,
+        info.config.subdomainHost,
+      )
+    }
+    return null
   }
+  if (type === 'tcpmux') {
+    const info = await fetchServerInfo()
+    if (info && info.config.tcpmuxHTTPConnectPort) {
+      return new TCPMuxProxy(
+        proxy,
+        info.config.tcpmuxHTTPConnectPort,
+        info.config.subdomainHost,
+      )
+    }
+    return null
+  }
+  if (type === 'stcp') {
+    return new STCPProxy(proxy)
+  }
+  if (type === 'sudp') {
+    return new SUDPProxy(proxy)
+  }
+  // Fallback for types without a dedicated class (e.g. xtcp). Matches the
+  // pattern in ProxyDetail.vue so the type tag and meta render correctly.
+  const bp = new BaseProxy(proxy)
+  bp.type = type
+  return bp
 }
 
-// Server info cache
-let serverInfo: {
-  vhostHTTPPort: number
-  vhostHTTPSPort: number
-  tcpmuxHTTPConnectPort: number
-  subdomainHost: string
-} | null = null
-
-const fetchServerInfo = async () => {
-  if (serverInfo) return serverInfo
-  const res = await getServerInfo()
-  serverInfo = res
-  return serverInfo
+const convertProxies = async (items: ProxyStatsInfo[]): Promise<BaseProxy[]> => {
+  const converted = await Promise.all(items.map((item) => convertProxy(item)))
+  return converted.filter((item): item is BaseProxy => item !== null)
 }
 
-const fetchData = async () => {
-  loading.value = true
-  proxies.value = []
+const fetchData = async (silent = false) => {
+  const seq = ++requestSeq
+  if (!silent) loading.value = true
 
   try {
-    const type = activeType.value
-    const json = await getProxiesByType(type)
+    const q = searchText.value.trim()
+    const data = await getProxiesV2({
+      page: page.value,
+      pageSize: pageSize.value,
+      type: activeType.value === 'all' ? undefined : activeType.value,
+      q: q || undefined,
+    })
+    if (seq !== requestSeq) return
 
-    if (type === 'tcp') {
-      proxies.value = json.proxies.map((p: any) => new TCPProxy(p))
-    } else if (type === 'udp') {
-      proxies.value = json.proxies.map((p: any) => new UDPProxy(p))
-    } else if (type === 'http') {
-      const info = await fetchServerInfo()
-      if (info && info.vhostHTTPPort) {
-        proxies.value = json.proxies.map(
-          (p: any) => new HTTPProxy(p, info.vhostHTTPPort, info.subdomainHost),
-        )
-      }
-    } else if (type === 'https') {
-      const info = await fetchServerInfo()
-      if (info && info.vhostHTTPSPort) {
-        proxies.value = json.proxies.map(
-          (p: any) =>
-            new HTTPSProxy(p, info.vhostHTTPSPort, info.subdomainHost),
-        )
-      }
-    } else if (type === 'tcpmux') {
-      const info = await fetchServerInfo()
-      if (info && info.tcpmuxHTTPConnectPort) {
-        proxies.value = json.proxies.map(
-          (p: any) =>
-            new TCPMuxProxy(p, info.tcpmuxHTTPConnectPort, info.subdomainHost),
-        )
-      }
-    } else if (type === 'stcp') {
-      proxies.value = json.proxies.map((p: any) => new STCPProxy(p))
-    } else if (type === 'sudp') {
-      proxies.value = json.proxies.map((p: any) => new SUDPProxy(p))
+    const maxPage = Math.max(1, Math.ceil(data.total / data.pageSize))
+    if (data.items.length === 0 && data.total > 0 && data.page > maxPage) {
+      page.value = maxPage
+      await fetchData(silent)
+      return
     }
+
+    const converted = await convertProxies(data.items)
+    if (seq !== requestSeq) return
+
+    proxies.value = converted
+    total.value = data.total
+    page.value = data.page
+    pageSize.value = data.pageSize
   } catch (error: any) {
+    if (seq !== requestSeq) return
     ElMessage({
       showClose: true,
       message: 'Failed to fetch proxies: ' + error.message,
       type: 'error',
     })
   } finally {
-    loading.value = false
+    if (seq === requestSeq) {
+      loading.value = false
+    }
   }
+}
+
+const clearSearchDebounce = () => {
+  if (searchDebounceTimer !== null) {
+    window.clearTimeout(searchDebounceTimer)
+    searchDebounceTimer = null
+  }
+}
+
+const resetPageAndFetch = () => {
+  clearSearchDebounce()
+  page.value = 1
+  fetchData()
+}
+
+const refreshData = () => {
+  fetchData()
+}
+
+const onPageChange = (value: number) => {
+  clearSearchDebounce()
+  page.value = value
+  fetchData()
+}
+
+const onPageSizeChange = (value: number) => {
+  pageSize.value = value
+  resetPageAndFetch()
+}
+
+const handleClearConfirm = async () => {
+  showClearDialog.value = false
+  await clearOfflineProxies()
 }
 
 const clearOfflineProxies = async () => {
@@ -291,25 +299,45 @@ const clearOfflineProxies = async () => {
   }
 }
 
+const sanitizeClientQuery = () => {
+  const hasClientQuery =
+    Object.prototype.hasOwnProperty.call(route.query, 'clientID') ||
+    Object.prototype.hasOwnProperty.call(route.query, 'user')
+  if (!hasClientQuery) return
+
+  const query = { ...route.query }
+  delete query.clientID
+  delete query.user
+  router.replace({ query })
+}
+
 // Watch for type changes
 watch(activeType, (newType) => {
+  clearSearchDebounce()
+  page.value = 1
   // Update route but preserve query params
   router.replace({ params: { type: newType }, query: route.query })
   fetchData()
 })
 
-// Watch for route query changes (client filter)
-watch(
-  () => [route.query.clientID, route.query.user],
-  ([newClientID, newUser]) => {
-    clientIDFilter.value = (newClientID as string) || ''
-    userFilter.value = (newUser as string) || ''
-  },
-)
+watch(searchText, () => {
+  clearSearchDebounce()
+  page.value = 1
+  searchDebounceTimer = window.setTimeout(() => {
+    searchDebounceTimer = null
+    fetchData()
+  }, 300)
+})
+
+watch(() => route.query, sanitizeClientQuery)
+
+onUnmounted(() => {
+  clearSearchDebounce()
+})
 
 // Initial fetch
+sanitizeClientQuery()
 fetchData()
-fetchClients()
 </script>
 
 <style scoped>
@@ -357,12 +385,6 @@ fetchClients()
   gap: 12px;
 }
 
-.action-btn {
-  border-radius: 8px;
-  padding: 8px 16px;
-  height: 36px;
-  font-weight: 500;
-}
 
 .filter-section {
   display: flex;
@@ -382,35 +404,9 @@ fetchClients()
   flex: 1;
 }
 
-.main-search,
-.client-select {
-  height: 44px;
-}
-
-.main-search :deep(.el-input__wrapper),
-.client-select :deep(.el-input__wrapper) {
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  padding: 0 16px;
-  height: 100%;
-  border: 1px solid var(--el-border-color);
-}
-
 .main-search :deep(.el-input__wrapper) {
-  font-size: 15px;
-}
-
-.client-select {
-  width: 240px;
-}
-
-.client-select :deep(.el-select__wrapper) {
-  border-radius: 12px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  padding: 0 12px;
-  height: 44px;
-  min-height: 44px;
-  border: 1px solid var(--el-border-color);
+  height: 32px;
+  border-radius: 8px;
 }
 
 .type-tabs {
@@ -457,13 +453,18 @@ fetchClients()
   padding: 60px 0;
 }
 
+.pagination-section {
+  display: flex;
+  justify-content: flex-end;
+}
+
 @media (max-width: 768px) {
   .search-row {
     flex-direction: column;
   }
 
-  .client-select {
-    width: 100%;
+  .pagination-section {
+    justify-content: center;
   }
 }
 </style>
